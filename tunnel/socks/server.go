@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"sync"
 	"time"
@@ -37,6 +36,8 @@ type Server struct {
 	mappingLock      sync.RWMutex
 	ctx              context.Context
 	cancel           context.CancelFunc
+	username         string
+	password         string
 }
 
 func (s *Server) AcceptConn(tunnel.Tunnel) (tunnel.Conn, error) {
@@ -70,15 +71,67 @@ func (s *Server) handshake(conn net.Conn) (*Conn, error) {
 	if version[0] != 5 {
 		return nil, common.NewError(fmt.Sprintf("invalid socks version %d", version[0]))
 	}
+
 	nmethods := [1]byte{}
 	if _, err := conn.Read(nmethods[:]); err != nil {
 		return nil, common.NewError("failed to read NMETHODS")
 	}
-	if _, err := io.CopyN(ioutil.Discard, conn, int64(nmethods[0])); err != nil {
-		return nil, common.NewError("socks failed to read methods").Base(err)
-	}
-	if _, err := conn.Write([]byte{0x5, 0x0}); err != nil {
-		return nil, common.NewError("failed to respond auth").Base(err)
+	if s.username != "" && s.password != "" {
+		if nmethods[0] == 0x00 {
+			return nil, common.NewError("failed to auth number")
+		}
+		buf := make([]byte, nmethods[0])
+		if _, err := conn.Read(buf); err != nil {
+			return nil, common.NewError("failed to read METHODS")
+		}
+		foundMethod := false
+		for i := 0; i < int(nmethods[0]); i++ {
+			if buf[i] == 0x02 {
+				foundMethod = true
+				break
+			}
+		}
+		if foundMethod {
+			if _, err := conn.Write([]byte{0x05, 0x02}); err != nil {
+				return nil, common.NewError("failed to respond auth").Base(err)
+			}
+		} else {
+			return nil, common.NewError("failed to auth method")
+		}
+
+		if _, err := conn.Read(version[:]); err != nil {
+			return nil, common.NewError("failed to read auth version")
+		}
+		if _, err := conn.Read(nmethods[:]); err != nil {
+			return nil, common.NewError("failed to read username len")
+		}
+		buf = make([]byte, nmethods[0])
+		if _, err := conn.Read(buf); err != nil {
+			return nil, common.NewError("failed to read username")
+		}
+		if string(buf) != s.username {
+			return nil, common.NewError("failed to auth username")
+		}
+		if _, err := conn.Read(nmethods[:]); err != nil {
+			return nil, common.NewError("failed to read password len")
+		}
+		buf = make([]byte, nmethods[0])
+		if _, err := conn.Read(buf); err != nil {
+			return nil, common.NewError("failed to read password")
+		}
+		if string(buf) != s.password {
+			return nil, common.NewError("failed to auth password")
+		}
+		if _, err := conn.Write([]byte{0x1, 0x0}); err != nil {
+			return nil, common.NewError("failed to respond auth").Base(err)
+		}
+	} else {
+		if _, err := io.CopyN(io.Discard, conn, int64(nmethods[0])); err != nil {
+			return nil, common.NewError("socks failed to read methods").Base(err)
+		}
+		if _, err := conn.Write([]byte{0x5, 0x0}); err != nil {
+			return nil, common.NewError("failed to respond auth").Base(err)
+		}
 	}
 
 	buf := [3]byte{}
@@ -255,6 +308,8 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (tunnel.Server, erro
 		timeout:          time.Duration(cfg.UDPTimeout) * time.Second,
 		listenPacketConn: listenPacketConn,
 		mapping:          make(map[string]*PacketConn),
+		username:         cfg.Username,
+		password:         cfg.Password,
 	}
 	go server.acceptLoop()
 	go server.packetDispatchLoop()

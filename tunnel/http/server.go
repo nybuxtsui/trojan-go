@@ -3,14 +3,15 @@ package http
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"strings"
 
 	"github.com/p4gefau1t/trojan-go/common"
+	"github.com/p4gefau1t/trojan-go/config"
 	"github.com/p4gefau1t/trojan-go/log"
 	"github.com/p4gefau1t/trojan-go/tunnel"
 )
@@ -66,9 +67,12 @@ type Server struct {
 	connChan chan tunnel.Conn
 	ctx      context.Context
 	cancel   context.CancelFunc
+	auth     string
 }
 
 func (s *Server) acceptLoop() {
+	resp407 := []byte("HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\nProxy-Authenticate: Basic\r\nContent-Length: 0\r\n\r\n")
+	authHeader := "Proxy-Authorization"
 	for {
 		conn, err := s.underlay.AcceptConn(&Tunnel{})
 		if err != nil {
@@ -83,13 +87,26 @@ func (s *Server) acceptLoop() {
 		}
 
 		go func(conn net.Conn) {
-			reqBufReader := bufio.NewReader(ioutil.NopCloser(conn))
+			reqBufReader := bufio.NewReader(io.NopCloser(conn))
 			req, err := http.ReadRequest(reqBufReader)
 			if err != nil {
 				log.Error(common.NewError("not a valid http request").Base(err))
 				return
 			}
 
+			if s.auth != "" {
+				auth := req.Header[authHeader]
+				if len(auth) == 0 {
+					conn.Write(resp407)
+					conn.Close()
+					return
+				}
+				if auth[0] != "Basic "+s.auth {
+					log.Error(common.NewError("http failed to auth, " + auth[0]))
+					conn.Close()
+					return
+				}
+			}
 			if strings.ToUpper(req.Method) == "CONNECT" { // CONNECT
 				addr, err := tunnel.NewAddressFromAddr("tcp", req.Host)
 				if err != nil {
@@ -140,7 +157,7 @@ func (s *Server) acceptLoop() {
 						return
 					}
 
-					respBufReader := bufio.NewReader(ioutil.NopCloser(respReader)) // read response from the remote
+					respBufReader := bufio.NewReader(io.NopCloser(respReader)) // read response from the remote
 					resp, err := http.ReadResponse(respBufReader, req)
 					if err != nil {
 						log.Error(common.NewError("http failed to read http response").Base(err))
@@ -186,12 +203,18 @@ func (s *Server) Close() error {
 }
 
 func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
+	cfg := config.FromContext(ctx, Name).(*Config)
 	ctx, cancel := context.WithCancel(ctx)
+	auth := ""
+	if cfg.Username != "" || cfg.Password != "" {
+		auth = base64.StdEncoding.EncodeToString([]byte(cfg.Username + ":" + cfg.Password))
+	}
 	server := &Server{
 		underlay: underlay,
 		connChan: make(chan tunnel.Conn, 32),
 		ctx:      ctx,
 		cancel:   cancel,
+		auth:     auth,
 	}
 	go server.acceptLoop()
 	return server, nil
